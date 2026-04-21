@@ -24,10 +24,12 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
+    user: "${UID}:${GID}"
 
   # ── TTS (Text-to-Speech) — Chatterbox on GPU ──────────────────────
   chatterbox-gpu:
     container_name: foreign-whispers-tts
+    user: "${UID}:${GID}"
     profiles: [nvidia]
     image: travisvn/chatterbox-tts-api:latest
     restart: unless-stopped
@@ -55,6 +57,7 @@ services:
   api:
     container_name: foreign-whispers-api
     profiles: [nvidia, cpu]
+    user: "${UID}:${GID}"
     build:
       context: .
       dockerfile: Dockerfile
@@ -62,10 +65,11 @@ services:
         USER_UID: "${UID:-1000}"
         USER_GID: "${GID:-1000}"
     restart: unless-stopped
-    network_mode: host
+    ports:
+       - "8080:8080"
     command: ["uv", "run", "uvicorn", "api.src.main:app", "--host", "0.0.0.0", "--port", "8080"]
     environment:
-      - CHATTERBOX_API_URL=http://localhost:8020
+      - CHATTERBOX_API_URL=http://chatterbox-gpu:8020
       - FW_WHISPER_MODEL=base
     volumes:
       - ./pipeline_data:/app/pipeline_data
@@ -77,13 +81,15 @@ services:
   frontend:
     container_name: foreign-whispers-frontend
     profiles: [nvidia, cpu]
+    user: "${UID}:${GID}"
     build:
       context: ./frontend
       dockerfile: Dockerfile
     restart: unless-stopped
-    network_mode: host
+    ports:
+      - "8501:8501"
     environment:
-      - API_URL=http://localhost:8080
+      - API_URL=http://api:8080
       - HOSTNAME=0.0.0.0
       - PORT=8501
     healthcheck:

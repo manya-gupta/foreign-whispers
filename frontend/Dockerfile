@@ -10,7 +10,7 @@ FROM base AS build
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
-ARG API_URL=http://localhost:8080
+ARG API_URL=http://api:8080
 ENV API_URL=${API_URL}
 RUN pnpm build
 
