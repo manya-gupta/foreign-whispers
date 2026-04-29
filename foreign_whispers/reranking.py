@@ -7,8 +7,111 @@ SegmentMetrics.  The translation re-ranking function is a **student assignment**
 
 import dataclasses
 import logging
+import os
+from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
+
+
+# Lookup tables for rule-based translation shortening
+SPANISH_SHORTENING_LUT = {
+    # Filler words & discourse markers
+    "fillers": {
+        "pues": "",
+        "bueno": "",
+        "bien": "",
+        "vaya": "",
+        "mira": "",
+        "oye": "",
+        "ya sabes": "",
+        "verdad": "",
+    },
+    # Common phrases → shorter alternatives
+    "phrases": {
+        "en este momento": "ahora",
+        "en la actualidad": "hoy",
+        "por lo tanto": "luego",
+        "sin embargo": "pero",
+        "de todas formas": "igual",
+        "a pesar de": "aunque",
+        "con respecto a": "sobre",
+        "en cuanto a": "sobre",
+        "más o menos": "aprox.",
+        "de alguna manera": "algo",
+        "de cierta forma": "así",
+        "por favor": "plis",
+        "gracias de antemano": "gracias",
+        "muchas gracias": "gracias",
+        "muy importante": "importante",
+        "donde estás": "ontas",
+        "hasta luego": "talogo",
+        "buenos días": "nosidas",
+        "buenas noches": "nosnoches",
+        "buenas tardes": "nostardes",
+        "fin de semana": "finde",
+    },
+    # Auxiliary verbs that can sometimes be dropped
+    "auxiliaries": {
+        "estar": "",
+        "ser": "",
+        "haber": "",
+    },
+    # Shorter synonyms 
+    "synonyms": {
+        "pequeño": "chico",
+        "rápido": "veloz",
+        "lento": "tardo",
+        "importante": "clave",
+        "interesante": "curioso",
+    },
+    # Contractions 
+    "contractions": {
+        "de el": "del",
+        "a el": "al",
+    },
+    # Apocopes (omission of sounds or letters at the end of a word)
+    "apocopes": {
+        "grande": "gran",
+        "bueno": "buen",
+        "malo": "mal",
+        "primero": "primer",
+        "tercero": "tercer",
+        "universidad": "uni",
+        "televisión": "tele",
+        "fotografía": "foto",
+        "profesor": "profe",
+        "profesora": "profe",
+        "absolutamente": "absolut",
+        "abuelo": "abu",
+        "abuela": "abu",
+        "colegio": "cole",
+        "instituto": "insti",
+        "hospital": "hospi",
+        "restaurante": "resto",
+        "biblioteca": "biblio",
+        "automóvil": "auto",
+        "bicicleta": "bici",
+        "computadora": "compu",
+        "metropolitano": "metro",
+        "facultad": "facu",
+        "bolígrafo": "boli",
+        "matemáticas": "mate",
+        "motocicleta": "moto",
+        "oficina": "ofi",
+    },
+    # Linguistic abbreviations    
+    "abbreviations": {
+        "autobus": "bus",
+        "por si acaso": "porsiaca",
+        "escuela preparatoria": "prepa",
+        "información": "info",
+        "aproximadamente": "aprox.",
+        "administración": "admin.",
+        "medicina": "med",
+        "máximo": "máx",
+        "mínimo": "mín",
+    }
+}
 
 
 @dataclasses.dataclass
@@ -157,10 +260,92 @@ def get_shorter_translations(
     Returns:
         Empty list (stub).  Implement to return ``TranslationCandidate`` items.
     """
+    ### Hybrid approach ###
+    ### use a Spanish LUT first on the translation and then call an LLM if needed ###
+
     logger.info(
-        "get_shorter_translations called for %.1fs budget (%d chars baseline) — "
-        "returning empty list (student assignment stub).",
+        "get_shorter_translations called for %.1fs budget (%d chars baseline) — ",
         target_duration_s,
         len(baseline_es),
     )
-    return []
+
+    # check if text meets target duration
+    benchmark = True if (len(baseline_es) / 15.0) <= target_duration_s else False
+
+    lut = SPANISH_SHORTENING_LUT
+    candidates = []
+
+    if not benchmark:  
+        for category, replacements in lut.items():
+            for long_form, short_form in replacements.items():
+                shortened_text = baseline_es.replace(long_form, short_form)
+                # track this as a candidate
+                candidates.append(TranslationCandidate(
+                    text=shortened_text,
+                    char_count=len(shortened_text),
+                    brevity_rationale=f"Applied {category} replacement"
+                ))
+        
+        # Sort by char_count (shortest first)
+        candidates.sort(key=lambda c: c.char_count)          
+        new_shortened_text = candidates[0].text if candidates else baseline_es
+        benchmark = True if (len(new_shortened_text) / 15.0) <= target_duration_s else False
+
+        if len(candidates) > 1 and not benchmark:
+            cat_list = []
+            for category, replacements in lut.items():
+                for long_form, short_form in replacements.items():
+                    new_shortened_text = new_shortened_text.replace(long_form, short_form)
+                    cat_list.append(category)
+            # add to beginning of list as shortest candidate
+            candidates.insert(0, TranslationCandidate(
+                text=new_shortened_text,
+                char_count=len(new_shortened_text),
+                brevity_rationale=f"Applied all potential replacements: {cat_list}"
+            ))
+        
+        # try again with all abbreviations applied
+        benchmark = True if (len(new_shortened_text) / 15.0) <= target_duration_s else False
+
+        # if its still too long, invoke LLM
+        # LLM info: https://huggingface.co/BSC-LT/salamandra-7b-instruct
+        if not benchmark:
+            
+            logger.info("Invoking LLM for further condensation of translation.")
+            
+            try:
+                from huggingface_hub import InferenceClient
+            except (ImportError, TypeError):
+                logger.warning("huggingface_hub not installed — skipping LLM re-ranking.")
+                return candidates
+            
+            # load SALAMANDRA_TOKEN from .env
+            try:
+                load_dotenv()
+            except Exception as exc:
+                logger.warning("Failed to load .env file: %s", exc)
+
+            api_token = os.getenv("SALAMANDRA_TOKEN")
+
+            reranking_client = InferenceClient(api_key=api_token)
+            response = reranking_client.text_generation(
+                model="BSC-LT/salamandra-7b-instruct",
+                inputs=(
+                    f"Condense the following Spanish text to fit within approximately {int(target_duration_s * 15)} characters"
+                    f"Preserve the original meaning as much as possible.\n\n"
+                    f"Original text: {baseline_es}\n\n"
+                    f"Context (previous segment): {context_prev}\n"
+                    f"Context (next segment): {context_next}\n\n"
+                    "Reply with only the shortened version:"
+                )
+            )
+            shortened_text = response.generated_text.strip()
+            candidates.append(TranslationCandidate(
+                text=shortened_text,
+                char_count=len(shortened_text),
+                brevity_rationale="LLM-generated condensation"
+            ))
+            # sort again
+            candidates.sort(key=lambda c: c.char_count)    
+                
+    return candidates 
