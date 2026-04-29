@@ -43,25 +43,34 @@ async def diarize_endpoint(video_id: str):
             skipped=True,
         )
 
-    # ---- YOUR CODE HERE ----
     # Step 1: Extract audio from video
-    #   video_path = settings.videos_dir / f"{title}.mp4"
-    #   audio_path = diar_dir / f"{title}.wav"
+    video_path = settings.videos_dir / f"{title}.mp4"
+    audio_path = diar_dir / f"{title}.wav"
     #   Use subprocess.run to call:
     #     ffmpeg -i <video_path> -vn -acodec pcm_s16le -ar 16000 -y <audio_path>
-    #
+    result = subprocess.run(
+    [
+        "ffmpeg",
+        "-i", video_path,
+        "-vn",
+        "-acodec", "pcm_s16le",
+        "-ar", "16000",
+        "-y", audio_path
+    ],
+    capture_output=True,
+    text=True,
+    check=True  # raises CalledProcessError if ffmpeg fails
+    )
+    
     # Step 2: Run diarization
-    #   diar_segments = _alignment_service.diarize(str(audio_path))
-    #
+    diar_segments = _alignment_service.diarize(str(audio_path))
+    
     # Step 3: Extract unique speakers
-    #   speakers = sorted(set(s["speaker"] for s in diar_segments))
-    #
+    speakers = sorted(set(s["speaker"] for s in diar_segments))
+    
     # Step 4: Cache result
-    #   result = {"speakers": speakers, "segments": diar_segments}
-    #   diar_path.write_text(json.dumps(result))
-    #
+    result = {"speakers": speakers, "segments": diar_segments}
+    diar_path.write_text(json.dumps(result))
+    
     # Step 5: Return DiarizeResponse
-    #   return DiarizeResponse(video_id=video_id, speakers=speakers, segments=diar_segments)
-    #
-    raise HTTPException(status_code=501, detail="Diarization not yet implemented")
-    # ---- END YOUR CODE ----
+    return DiarizeResponse(video_id=video_id, speakers=speakers, segments=diar_segments)
