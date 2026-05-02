@@ -17,29 +17,112 @@ import dataclasses
 import re
 import unicodedata
 from enum import Enum
-
+import pylabeador
+import re
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
+import numpy as np
+from youtube_transcript_api import YouTubeTranscriptApi
 
 def _count_syllables(text: str) -> int:
-    """Count syllables in target-language text via vowel-cluster counting.
-
-    Designed for Romance languages (Spanish, French, Italian, Portuguese).
-    Strips accents then counts contiguous vowel runs. Each run = one syllable.
-    Returns at least 1 for any non-empty text so the rate never divides by zero.
     """
-    # Normalise: decompose accented chars, keep only ASCII letters + spaces
-    nfkd = unicodedata.normalize("NFKD", text.lower())
-    ascii_text = "".join(c for c in nfkd if not unicodedata.combining(c))
-    clusters = re.findall(r"[aeiou]+", ascii_text)
-    return max(1, len(clusters))
+    Changed from original
+    Count syllables use pylabeador as it is specific to Spanish and Romance languages
+    Training is done on the original english (which uses this function)
+    TODO if time permits, train the model on concrete spanish data and save the model
+        instead of basing it on whatever video is being passed to the pipeline
+    """
+    # changed to use pylabeador
+    all_syll = []
+    numbers = 0
+    total_syll = 0
+    clean_text = re.sub(r"[^\w\s]", "", text)
+    for word in clean_text.split():
+        if word:
+            if re.search(r"\d", word):  # contains a number
+                total_syll = numbers + 3 # take an average
+            else:
+                syllables = pylabeador.syllabify(word)
+                all_syll.extend(syllables)
+                total_syll += len(syllables)
+    return max(1, total_syll)
 
-
+''' this method did not work at all!! was not getting any stretch for either syllable rate '''
 _SYLLABLE_RATE = 4.5  # syllables per second for Romance languages
+_SPAN_SYLLABLE_RATE = 7.8 # faster for spanish
 
 
 def _estimate_duration(text: str) -> float:
-    """Estimate TTS duration in seconds using a syllable-rate heuristic."""
-    return _count_syllables(text) / _SYLLABLE_RATE
+        
+    # Estimate TTS duration in seconds using a syllable-rate heuristic."""
+    return _count_syllables(text) / _SYLLABLE_RATE # change to spanish rate
 
+
+def _get_training_video():
+    ytt_api = YouTubeTranscriptApi()
+    transcript  = ytt_api.fetch("ciHTAhKrxVg", languages=['es'])
+    training_segments = []
+    for seg in transcript:
+        training_segments.append({
+            "text": seg.text,
+            "start": seg.start,
+            "end": seg.start + seg.duration
+        })
+    return training_segments
+
+
+
+'''implemented a new class to handle the ridge regression model
+this serves as the new estimate for duration'''
+@dataclasses.dataclass
+class TTSDurationPredictor:
+    alpha: float = 1.0
+    _model: Ridge = dataclasses.field(default_factory=lambda: Ridge(alpha=1.0), init=False, repr=False)
+    _scaler: StandardScaler = dataclasses.field(default_factory=StandardScaler, init=False, repr=False)
+    _fitted: bool = dataclasses.field(default=False, init=False, repr=False)
+
+    # --- feature extraction ---
+
+    def _extract_features_training(self, text: str) -> dict:
+        words = text.strip().split()
+        syllables = _count_syllables(text)
+        return {
+            "syllable_count":  syllables,
+            "comma_count":     text.count(","),
+            "period_count":    len(re.findall(r"[.;:]", text)),
+            "avg_word_len":    np.mean([len(w) for w in words]) if words else 0,
+            "long_word_ratio": sum(len(w) > 6 for w in words) / max(len(words), 1),
+            "numeral_count":   len(re.findall(r"\b\d+\b", text)),
+        }
+
+    # --- training ---
+
+    def fit(self, segments: list[dict]) -> "TTSDurationPredictor":
+        """segments: list of {"text": str, "start": float, "end": float}"""
+        X = np.array([list(self._extract_features_training(s["text"]).values()) for s in segments])
+        y = np.array([s["end"] - s["start"] for s in segments])
+        self._scaler.fit(X)
+        self._model.fit(self._scaler.transform(X), y)
+        self._fitted = True
+        return self
+
+    # --- inference ---
+
+    # used in place of _estimate_duration
+    def predict(self, text: str) -> float:
+        if not self._fitted:
+            raise RuntimeError("Call .fit() before .predict()")
+        x = list(self._extract_features_training(text).values())
+        x = np.array(x).reshape(1, -1)
+        return float(self._model.predict(self._scaler.transform(x))[0])
+
+    # likely will not be used but good to have
+    def predict_batch(self, texts: list[str]) -> np.ndarray:
+        if not self._fitted:
+            raise RuntimeError("Call .fit() before .predict_batch()")
+        X = np.array([list(self._extract_features_training(t).values()) for t in texts])
+        return self._model.predict(self._scaler.transform(X))
+    
 
 @dataclasses.dataclass
 class SegmentMetrics:
@@ -76,12 +159,14 @@ class SegmentMetrics:
     translated_text:   str
     src_char_count:    int
     tgt_char_count:    int
+    predictor:         TTSDurationPredictor
     predicted_tts_s:   float = dataclasses.field(init=False)
     predicted_stretch: float = dataclasses.field(init=False)
     overflow_s:        float = dataclasses.field(init=False)
 
     def __post_init__(self) -> None:
-        self.predicted_tts_s = _estimate_duration(self.translated_text)
+        self.predicted_tts_s = self.predictor.predict(self.translated_text)
+        print(self.translated_text, self.predicted_tts_s, self.source_duration_s)
         self.predicted_stretch = (
             self.predicted_tts_s / self.source_duration_s
             if self.source_duration_s > 0 else 1.0
@@ -135,7 +220,7 @@ class AlignedSegment:
     action:          AlignAction
     gap_shift_s:     float = 0.0
     stretch_factor:  float = 1.0
-
+    
 
 def decide_action(m: SegmentMetrics, available_gap_s: float = 0.0) -> AlignAction:
     """Choose the alignment action for a single segment.
@@ -194,6 +279,13 @@ def compute_segment_metrics(
         List of ``SegmentMetrics``, one per paired segment.  If the transcripts
         have different lengths, the shorter one determines the output length.
     """
+
+    # Collect training data from your pipeline
+    # segments from transcriptions + tts_audio durations
+    predictor = TTSDurationPredictor(alpha=1.0)
+    predictor.fit(es_transcript["segments"])  # train on target segments
+
+
     metrics = []
     for i, (en_seg, es_seg) in enumerate(
         zip(en_transcript.get("segments", []), es_transcript.get("segments", []))
@@ -209,6 +301,7 @@ def compute_segment_metrics(
             translated_text   = tgt_text,
             src_char_count    = len(src_text),
             tgt_char_count    = len(tgt_text),
+            predictor         = predictor,
         ))
     return metrics
 
